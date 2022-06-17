@@ -1,6 +1,41 @@
 # Databricks notebook source
 !pip install mlflow --quiet
-!pip install mljar-supervised --quiet
+
+# COMMAND ----------
+
+dbutils.widgets.removeAll()
+dbutils.widgets.text(
+  name='experiment_id',
+  defaultValue='1910247067387441',
+  label='Experiment ID'
+)
+
+
+dbutils.widgets.dropdown("outcome","icu",["misa_pt", "multi_class", "death", "icu"])
+OUTCOME = dbutils.widgets.get("outcome")
+
+dbutils.widgets.dropdown("demographics", "True", ["True", "False"])
+USE_DEMOG = dbutils.widgets.get("demographics")
+if USE_DEMOG == "True": DEMOG = True
+else: USE_DEMOG = False
+
+dbutils.widgets.dropdown("stratify", "all", ['all', 'death', 'misa_pt', 'icu'])
+STRATIFY = dbutils.widgets.get("stratify")
+
+dbutils.widgets.dropdown("experimenting", "False",  ["True", "False"])
+EXPERIMENTING = dbutils.widgets.get("experimenting")
+if EXPERIMENTING == "True": EXPERIMENTING = True
+else: EXPERIMENTING = False
+
+# COMMAND ----------
+
+import mlflow
+experiment = dbutils.widgets.get("experiment_id")
+assert experiment is not None
+current_experiment = mlflow.get_experiment(experiment)
+assert current_experiment is not None
+experiment_id= current_experiment.experiment_id
+
 
 # COMMAND ----------
 
@@ -23,53 +58,16 @@ import mlflow
 
 # COMMAND ----------
 
-import mlflow
-
-dbutils.widgets.removeAll()
-dbutils.widgets.text(
-  name='experiment_id',
-  defaultValue='1006044204069715',
-  label='Experiment ID'
-)
-
-dbutils.widgets.dropdown("outcome","icu",["misa_pt", "multi_class", "death", "icu"])
-OUTCOME = dbutils.widgets.get("outcome")
-
-dbutils.widgets.dropdown("demographics", "True", ["True", "False"])
-USE_DEMOG = dbutils.widgets.get("demographics")
-if USE_DEMOG == "True": DEMOG = True
-else: USE_DEMOG = False
-
-dbutils.widgets.dropdown("stratify", "all", ['all', 'death', 'misa_pt', 'icu'])
-STRATIFY = dbutils.widgets.get("stratify")
-
-dbutils.widgets.dropdown("average", "weighted", ['micro', 'macro', 'weighted'])
-AVERAGE = dbutils.widgets.get("average")
-
-dbutils.widgets.dropdown("experimenting", "False",  ["True", "False"])
-EXPERIMENTING = dbutils.widgets.get("experimenting")
-if EXPERIMENTING == "True": EXPERIMENTING = True
-else: EXPERIMENTING = False
-
-experiment = dbutils.widgets.get("experiment_id")
-assert experiment is not None
-current_experiment = mlflow.get_experiment(experiment)
-assert current_experiment is not None
-experiment_id= current_experiment.experiment_id
-
-# COMMAND ----------
-
 # Setting the globals
 #OUTCOME = 'misa_pt'
 #USE_DEMOG = True
-#STRATIFY ='all'
-
 AVERAGE = 'weighted'
 DAY_ONE_ONLY = True
 TEST_SPLIT = 0.2
 VAL_SPLIT = 0.1
 RAND = 2022
 CHRT_PRFX = ''
+#STRATIFY ='all'
 
 # Setting the directories and importing the data
 # If no args are passed to overwrite these values, use repo structure to construct
@@ -86,6 +84,10 @@ if output_dir is not None:
 pkl_dir = os.path.join(output_dir, "pkl", "")
 stats_dir = os.path.join(output_dir, "analysis", "")
 probs_dir = os.path.join(stats_dir, "probs", "")
+
+# COMMAND ----------
+
+stats_dir
 
 # COMMAND ----------
 
@@ -161,113 +163,141 @@ else:
 
 # COMMAND ----------
 
-train_set, test = train_test_split(range(n_patients),
+train, test = train_test_split(range(n_patients),
                                test_size=TEST_SPLIT,
                                stratify=strat_var,
                                random_state=RAND)
 
 # Doing a validation split for threshold-picking on binary problems
-train, val = train_test_split(train_set,
+train, val = train_test_split(train,
                               test_size=VAL_SPLIT,
-                              stratify=strat_var[train_set],
+                              stratify=strat_var[train],
                               random_state=RAND)
 
 # COMMAND ----------
 
-suffix = "_outcome_"+OUTCOME+"_stratify_"+STRATIFY
-
-if EXPERIMENTING == True: SAMPLE = 1000
+if EXPERIMENTING == True: SAMPLE = 100
 else: SAMPLE = X.shape[0]
-
-X_train = X[train][:SAMPLE]
-X_val = X[val][:SAMPLE]
-X_test = X[test][:SAMPLE]
-
-y_train = y[train][:SAMPLE]
-y_val = y[val][:SAMPLE]
-y_test = y[test][:SAMPLE]
-
 
 # COMMAND ----------
 
-X_train.shape
+X.shape
+
+# COMMAND ----------
+
+def convert_pandas_to_spark_with_vectors(a_dataframe, c_names):
+    from pyspark.sql import SparkSession
+    from pyspark.ml.feature import VectorAssembler
+
+    assert isinstance (a_dataframe,  pd.DataFrame)
+    assert c_names is not None
+    assert len(c_names)>0
+
+    inc=min(10000, a_dataframe.shape[0])
+    bool = True
+    for i in range((a_dataframe.shape[0]//inc)+1):
+
+        
+        if (i*inc) < a_dataframe.shape[0]:
+            a_rdd = spark.sparkContext.parallelize(a_dataframe[i*inc:(1+i)*inc].to_numpy())
+            a_df = (a_rdd.map(lambda x: x.tolist()).toDF(c_names)  )
+
+            #a_df = spark.createDataFrame(a_rdd, c_names)
+
+            vecAssembler = VectorAssembler(outputCol="features")
+            vecAssembler.setInputCols(c_names)
+            a_spark_vector = vecAssembler.transform(a_df)
+
+            if bool == True:
+                spark_df = a_spark_vector
+                bool = False
+            else:
+                spark_df = spark_df.union(a_spark_vector)
+    
+    old_col_name = "_"+str(a_dataframe.shape[1]-1) # vector assembler would change the name of collumn y
+    print(old_col_name)
+    spark_df = spark_df.withColumnRenamed (old_col_name,'y')
+    time_col_name = "_"+str(a_dataframe.shape[1]) # vector assembler would change the name of collumn y
+    print(time_col_name)
+    spark_df = spark_df.withColumnRenamed (old_col_name,'time-col')
+    
+    return spark_df
+
+
+def change_columns_names (X):
+    c_names = list()
+    for i in range(0, X.shape[1]):
+        c_names = c_names + ['c'+str(i)] 
+    return c_names
 
 # COMMAND ----------
 
 from datetime import datetime
-date_time = str(datetime.now()).replace('-','_').replace(':','_').replace('.','_')
-mljar_folder = '/tmp/mljar_'+date_time
-mljar_folder
-
-# COMMAND ----------
+c_names = change_columns_names(X)
 
 #
-# requested by AutoML
+# add y and time stamp to pandas 
 #
 
-X_train_df = pd.DataFrame(X_train.toarray())
-X_val_df  = pd.DataFrame(X_val.toarray())
-X_test_df  = pd.DataFrame(X_test.toarray())
+X_train_pandas = pd.DataFrame(X[train][:SAMPLE].toarray())
+X_train_pandas['y'] = y[train][:SAMPLE]
+X_train_pandas['time-col'] = datetime.today().timestamp()
+print( datetime.today().timestamp())
 
-y_train_df = pd.DataFrame(y_train)
-y_val_df  = pd.DataFrame(y_val)
-y_test_df  = pd.DataFrame(y_test)
+X_val_pandas = pd.DataFrame(X[val][:SAMPLE].toarray())
+X_val_pandas['y'] = y[val][:SAMPLE]
+X_val_pandas['time-col'] =  datetime.today().timestamp()
+print( datetime.today().timestamp())
 
-X_train_df = pd.concat([X_train_df, X_val_df])
-y_train_df = pd.concat([y_train_df, y_val_df])
+
+X_test_pandas = pd.DataFrame(X[test][:SAMPLE].toarray())
+X_test_pandas['y'] = y[test][:SAMPLE]
+X_test_pandas['time-col'] =  datetime.today().timestamp()
+print( datetime.today().timestamp())
+
+#
+# create concated pandas with train, val, and test
+#
+
+X_pandas = pd.concat([X_train_pandas,X_val_pandas,X_test_pandas])
+
+#
+# create incrementally spark data frames
+#
+
+#X_train_spark = convert_pandas_to_spark_with_vectors(X_train_pandas, c_names)
+#X_val_spark =   convert_pandas_to_spark_with_vectors(X_val_pandas, c_names)
+#X_test_spark =  convert_pandas_to_spark_with_vectors(X_test_pandas, c_names)
+X_spark =  convert_pandas_to_spark_with_vectors(X_pandas, c_names)
+
+
+
+# COMMAND ----------
+
+display(X_spark.select(['features', 'y','time-col']))
+
+# COMMAND ----------
+
+X_spark = X_spark.withColumn("y",col("y").cast(IntegerType))
+
+# COMMAND ----------
+
+from pyspark.ml.functions import vector_to_array
+to_automl = X_spark.select(vector_to_array("features").alias("features"),"y")
 
 
 # COMMAND ----------
 
-X_train_df.shape
+from databricks import automl
+summary = automl.classify(to_automl, time_col="time-col",primary_metric="roc_auc",target_col="y", timeout_minutes=1200)
 
 # COMMAND ----------
 
-from supervised.automl import AutoML
-import mlflow
-mlflow.end_run()
-mlflow.start_run(experiment_id=experiment_id)
-mlflow.autolog()
-
-vs = {"validation_type" : "split", "train_ratio":.8, "shuffle":False, "stratify": False}
-
-
-
-
-automl = AutoML(results_path=mljar_folder, validation_strategy=vs, n_jobs=-1)
-automl.fit(X_train_df, y_train_df)
+summary = automl.classify(to_automl, time_col="time-col",primary_metric="log_loss",target_col="y", timeout_minutes=1200)
 
 # COMMAND ----------
 
-y_pred_proba = automl.predict_proba(X_test_df)
-y_pred_proba
-
-# COMMAND ----------
-
-import tools.analysis as ta
-out = ta.clf_metrics(y_test_df.to_numpy(),y_pred_proba[:,1])
-for i in out.columns:
-    mlflow.log_metric("Testing "+i, out[i].iloc[0])
-out
-
-# COMMAND ----------
-
-mlflow.log_param("average", AVERAGE)
-mlflow.log_param("demographics", USE_DEMOG)
-mlflow.log_param("outcome", OUTCOME)
-mlflow.log_param("stratify", STRATIFY)
-
-# COMMAND ----------
-
-mlflow.log_artifacts(mljar_folder)
-
-# COMMAND ----------
-
-mlflow.end_run()
-
-# COMMAND ----------
-
-display(out)
+summary = automl.classify(to_automl, time_col="time-col",primary_metric="f1",target_col="y", timeout_minutes=1200)
 
 # COMMAND ----------
 
